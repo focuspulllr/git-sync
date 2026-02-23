@@ -60,7 +60,8 @@ function Push-Repo([string]$Dir, [string]$Label) {
     if (-not $status.Out) { return "$Label : no changes" }
 
     Invoke-Git $Dir @("add", "-A") | Out-Null
-    $r = Invoke-Git $Dir @("commit", "-m", "sync: auto-commit from $env:COMPUTERNAME")
+    $msg = "sync: auto-commit from $env:COMPUTERNAME"
+    $r = Invoke-Git $Dir @("commit", "-m", "`"$msg`"")
     if ($r.Code -ne 0) { return "$Label : commit failed" }
 
     $branch = (Invoke-Git $Dir @("branch", "--show-current")).Out
