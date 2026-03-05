@@ -54,6 +54,36 @@ function Get-WorkDirs {
     return $dirs
 }
 
+# --- Count dirs needing push (uncommitted or unpushed) ---
+function Get-PushCount {
+    $dirs = Get-WorkDirs
+    $cnt = 0
+    foreach ($d in $dirs) {
+        $status = (Invoke-Git $d.Path @("status", "--porcelain")).Out
+        if ($status) { $cnt++; continue }
+        $branch = (Invoke-Git $d.Path @("branch", "--show-current")).Out
+        if (-not $branch) { continue }
+        $ahead = (Invoke-Git $d.Path @("rev-list", "--count", "origin/$branch..HEAD")).Out
+        if ($ahead -match "^\d+$" -and [int]$ahead -gt 0) { $cnt++ }
+    }
+    return $cnt
+}
+
+# --- Count dirs needing pull (behind origin) ---
+function Get-PullCount {
+    $dirs = Get-WorkDirs
+    if ($dirs.Count -eq 0) { return 0 }
+    Invoke-Git $script:repoPath @("fetch", "origin") 2>$null | Out-Null
+    $cnt = 0
+    foreach ($d in $dirs) {
+        $branch = (Invoke-Git $d.Path @("branch", "--show-current")).Out
+        if (-not $branch) { continue }
+        $behind = (Invoke-Git $d.Path @("rev-list", "--count", "HEAD..origin/$branch")).Out
+        if ($behind -match "^\d+$" -and [int]$behind -gt 0) { $cnt++ }
+    }
+    return $cnt
+}
+
 # --- Push one dir ---
 function Push-Repo([string]$Dir, [string]$Label) {
     $status = Invoke-Git $Dir @("status", "--porcelain")
@@ -112,27 +142,44 @@ function Do-SelectFolder {
 
 function Do-Push {
     if (-not $script:repoPath) { Do-SelectFolder; return }
-    Show-Balloon "Git Sync" "Pushing..." 1000
+    $dirs = Get-WorkDirs
+    Show-Balloon "Git Sync" "Pushing... ($($dirs.Count)개)" 1000
     $results = @()
-    foreach ($d in Get-WorkDirs) { $results += Push-Repo $d.Path $d.Label }
-    Show-Balloon "Push Done" ($results -join "`n")
+    foreach ($d in $dirs) { $results += Push-Repo $d.Path $d.Label }
+    $done = ($results | Where-Object { $_ -match "pushed|no changes" }).Count
+    Show-Balloon "Push Done" "완료: $done/$($dirs.Count)개`n$($results -join "`n")"
 }
 
 function Do-Pull {
     if (-not $script:repoPath) { Do-SelectFolder; return }
-    Show-Balloon "Git Sync" "Pulling..." 1000
+    $dirs = Get-WorkDirs
+    Show-Balloon "Git Sync" "Pulling... ($($dirs.Count)개)" 1000
     $results = @()
-    foreach ($d in Get-WorkDirs) { $results += Pull-Repo $d.Path $d.Label }
-    Show-Balloon "Pull Done" ($results -join "`n")
+    foreach ($d in $dirs) { $results += Pull-Repo $d.Path $d.Label }
+    $done = ($results | Where-Object { $_ -match "updated|up to date" }).Count
+    Show-Balloon "Pull Done" "완료: $done/$($dirs.Count)개`n$($results -join "`n")"
 }
 
-# --- Update menu text to show current repo ---
+# --- Update menu text to show current repo and counts ---
 function Update-MenuState {
     if ($script:repoPath) {
         $folderBtn.Text = "Repo: $(Split-Path $script:repoPath -Leaf)  ..."
     } else {
         $folderBtn.Text = "Select Repo Folder..."
     }
+    Update-CountDisplay
+}
+
+function Update-CountDisplay {
+    if (-not $script:repoPath) {
+        $pushCountItem.Visible = $false
+        $pullCountItem.Visible = $false
+        return
+    }
+    $pushCountItem.Visible = $true
+    $pullCountItem.Visible = $true
+    $pushCountItem.Text = "  Commit+Push: $(Get-PushCount)"
+    $pullCountItem.Text = "  Pull: $(Get-PullCount)"
 }
 
 # --- Tray icon ---
@@ -153,6 +200,11 @@ $menu.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 $folderBtn = $menu.Items.Add("Select Repo Folder...")
 $folderBtn.Add_Click({ Do-SelectFolder })
 
+$pushCountItem = $menu.Items.Add("  Commit+Push: 0")
+$pushCountItem.Enabled = $false
+$pullCountItem = $menu.Items.Add("  Pull: 0")
+$pullCountItem.Enabled = $false
+
 $menu.Items.Add("-") | Out-Null
 
 $pushBtn = $menu.Items.Add("Commit + Push")
@@ -171,6 +223,10 @@ $exitBtn.Add_Click({
 })
 
 $notifyIcon.ContextMenuStrip = $menu
+
+$menu.Add_Opening({
+    if ($script:repoPath) { Update-CountDisplay }
+})
 
 $notifyIcon.Add_Click({
     if ($_.Button -eq [System.Windows.Forms.MouseButtons]::Left) {
