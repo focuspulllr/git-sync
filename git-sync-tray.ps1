@@ -172,17 +172,9 @@ function Do-SelectFolder {
     }
 }
 
-# --- Push/Pull background job (buttons disabled, count-based timeout) ---
-$script:pushPullJob = $null
-$script:pushPullJobStart = $null
-$script:pushPullJobType = $null
-$script:pushPullJobTimeoutSec = 10
-$script:pushPullSafetyTimer = $null
-
-function Get-JobTimeoutSec {
-    param([int]$Count)
-    return [math]::Min(10 + $Count * 2, 60)
-}
+# --- Push/Pull with progress-based stall detection (7 sec no progress = force stop) ---
+$script:pushPullState = $null
+$script:pushPullStallSec = 7
 
 function Enable-PushPullButtons {
     $pushBtn.Enabled = $true
@@ -190,12 +182,8 @@ function Enable-PushPullButtons {
 }
 
 function Sync-PushPullButtonState {
-    if (-not $script:pushPullJob -and (-not $pushBtn.Enabled -or -not $pullBtn.Enabled)) {
+    if (-not $script:pushPullState -and (-not $pushBtn.Enabled -or -not $pullBtn.Enabled)) {
         Enable-PushPullButtons
-        if ($script:pushPullSafetyTimer) {
-            try { $script:pushPullSafetyTimer.Stop(); $script:pushPullSafetyTimer.Dispose() } catch { }
-            $script:pushPullSafetyTimer = $null
-        }
     }
 }
 
@@ -204,87 +192,86 @@ function Disable-PushPullButtons {
     $pullBtn.Enabled = $false
 }
 
-function Finish-PushPullJob {
+function Finish-PushPullState {
     param([string]$Title, [string]$Text)
-    try { Stop-Job $script:pushPullJob -ErrorAction SilentlyContinue } catch { }
-    try { Remove-Job $script:pushPullJob -Force -ErrorAction SilentlyContinue } catch { }
-    $script:pushPullJob = $null
-    $script:pushPullJobStart = $null
-    $script:pushPullJobType = $null
-    try {
-        if ($script:pushPullSafetyTimer) {
-            $script:pushPullSafetyTimer.Stop()
-            $script:pushPullSafetyTimer.Dispose()
-        }
-    } catch { }
-    $script:pushPullSafetyTimer = $null
+    if ($script:pushPullState) {
+        try {
+            $job = $script:pushPullState.Job
+            if ($job -and $job.Process -and -not $job.Process.HasExited) {
+                $job.Process.Kill()
+            }
+        } catch { }
+        try {
+            if ($script:pushPullState.PowerShell) {
+                $script:pushPullState.PowerShell.Stop()
+                $script:pushPullState.PowerShell.Dispose()
+            }
+        } catch { }
+        try {
+            if ($script:pushPullState.Runspace) {
+                $script:pushPullState.Runspace.Close()
+                $script:pushPullState.Runspace.Dispose()
+            }
+        } catch { }
+        $script:pushPullState = $null
+    }
     Enable-PushPullButtons
     if ($Title) { try { Show-Balloon $Title $Text } catch { } }
     try { Refresh-CountCacheSync } catch { }
 }
 
-function Check-PushPullJob {
-    if (-not $script:pushPullJob) { return }
+function Check-PushPullState {
+    if (-not $script:pushPullState) { return }
+    $st = $script:pushPullState
+    $job = $st.Job
     try {
-        $state = $script:pushPullJob.State
-    } catch {
-        Finish-PushPullJob "Error" "Job state inaccessible."
-        return
-    }
-    if ($state -eq "Running") {
-        $limit = $script:pushPullJobTimeoutSec
-        if ($script:pushPullJobStart -and ((Get-Date) - $script:pushPullJobStart).TotalSeconds -gt $limit) {
-            Finish-PushPullJob "Timeout" "Job exceeded ${limit}s, re-enabled."
+        if ($st.PowerShell.InvocationStateInfo.State -eq "Failed") {
+            Finish-PushPullState "Error" $st.PowerShell.InvocationStateInfo.Reason.Message
             return
         }
-        return
-    }
-    if ($state -eq "Failed" -or $state -eq "Stopped" -or $state -eq "Blocked" -or $state -eq "Disconnected") {
-        Finish-PushPullJob "Error" "Job $state."
-        return
-    }
-    $type = $script:pushPullJobType
-    try {
-        $r = Receive-Job $script:pushPullJob
+        if (-not $st.PowerShell.IsCompleted) {
+            # Check stall: 7 sec without progress
+            $last = if ($job) { $job.LastProgressTime } else { $st.LastProgressTime }
+            $proc = if ($job) { $job.Process } else { $null }
+            if ($last -and $proc -and -not $proc.HasExited) {
+                $elapsed = ((Get-Date) - $last).TotalSeconds
+                if ($elapsed -gt $script:pushPullStallSec) {
+                    Finish-PushPullState "Stalled" "No progress for $($script:pushPullStallSec)s, stopped."
+                    return
+                }
+            }
+            return
+        }
+        # Completed
+        $type = $st.Type
+        $r = $st.PowerShell.EndInvoke($st.AsyncResult)
+        Finish-PushPullState $null $null
         if ($r -and $r.Count -ge 2) {
             $msg = $r[0] -join "`n"
             $commits = $r[1]
             if ($type -eq "push") {
-                Finish-PushPullJob "Push Done" "Done: $commits commits`n$msg"
+                Show-Balloon "Push Done" "Done: $commits commits`n$msg"
             } else {
-                Finish-PushPullJob "Pull Done" "Done: $commits commits`n$msg"
+                Show-Balloon "Pull Done" "Done: $commits commits`n$msg"
             }
         } else {
-            Finish-PushPullJob "Error" "Job returned no result."
+            Show-Balloon "Error" "No result returned."
         }
+        try { Refresh-CountCacheSync } catch { }
     } catch {
-        Finish-PushPullJob "Error" $_.Exception.Message
+        Finish-PushPullState "Error" $_.Exception.Message
     }
 }
 
-function Do-Push {
-    if (-not $script:repoPath) { Do-SelectFolder; return }
-    if ($script:pushPullJob -and $script:pushPullJob.State -eq "Running") { return }
-    $path = $script:repoPath
-    $pushCount = 0
-    try {
-        $status = (Invoke-Git $path @("status", "--porcelain") -TimeoutMs 3000).Out
-        $hasUncommitted = [bool]$status
-        $br = (Invoke-Git $path @("branch", "--show-current") -TimeoutMs 3000).Out
-        if ($br) {
-            $ahead = (Invoke-Git $path @("rev-list", "--count", "origin/$br..HEAD") -TimeoutMs 3000).Out
-            $pushCount = if ($ahead -match "^\d+$") { [int]$ahead } else { 0 }
-        }
-        if ($hasUncommitted) { $pushCount = [math]::Max($pushCount, 1) }
-    } catch { }
-    $script:pushPullJobTimeoutSec = Get-JobTimeoutSec $pushCount
-    Disable-PushPullButtons
-    Show-Balloon "Git Sync" "Pushing..." 1000
-    $script:pushPullJob = Start-Job -ScriptBlock {
-        param($repoPath)
-        $results = @()
-        $totalCommits = 0
-        $dirs = @(@{ Path = $repoPath; Label = "main" })
+$script:pushPullScript = {
+    param($job)
+    $repoPath = $job.RepoPath
+    $type = $job.Type
+    $results = @()
+    $totalCommits = 0
+    $dirs = @(@{ Path = $repoPath; Label = "main" })
+    $job.LastProgressTime = Get-Date
+    if ($type -eq "push") {
         foreach ($d in $dirs) {
             $status = & git -C $d.Path status --porcelain 2>$null
             if ($status) {
@@ -296,47 +283,45 @@ function Do-Push {
             $ahead = & git -C $d.Path rev-list --count "origin/$br..HEAD" 2>$null
             $n = if ($ahead -match "^\d+$") { [int]$ahead } else { 0 }
             if ($n -eq 0) { $results += "$($d.Label) : no changes"; continue }
-            $err = & git -C $d.Path push origin $br 2>&1
-            if ($LASTEXITCODE -eq 0) {
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "git"
+            $psi.Arguments = "-C `"$($d.Path)`" push --progress origin $br"
+            $psi.WorkingDirectory = $d.Path
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $job.Process = $p
+            $reader = $p.StandardError
+            $job.Stderr = [System.Text.StringBuilder]::new()
+            $readerThread = [System.Threading.Thread]::new({
+                try {
+                    while ($true) {
+                        $line = $reader.ReadLine()
+                        if ($line -eq $null) { break }
+                        $job.LastProgressTime = Get-Date
+                        [void]$job.Stderr.AppendLine($line)
+                    }
+                } catch { }
+            })
+            $readerThread.IsBackground = $true
+            $readerThread.Start()
+            $p.WaitForExit()
+            $readerThread.Join(2000) | Out-Null
+            $stdout = $p.StandardOutput.ReadToEnd()
+            $stderr = $job.Stderr.ToString().Trim()
+            if ($p.ExitCode -eq 0) {
                 $results += "$($d.Label) : pushed ($br)"
                 $totalCommits += $n
             } else {
-                $results += "$($d.Label) : push failed - $err"
+                $results += "$($d.Label) : push failed - $stderr"
             }
         }
-        ,@($results, $totalCommits)
-    } -ArgumentList $path
-    $script:pushPullJobStart = Get-Date
-    $script:pushPullJobType = "push"
-    Start-PollTimerIfNeeded
-    $timeoutMs = $script:pushPullJobTimeoutSec * 1000
-    $script:pushPullSafetyTimer = New-Object System.Windows.Forms.Timer
-    $script:pushPullSafetyTimer.Interval = $timeoutMs
-    $script:pushPullSafetyTimer.Add_Tick({
-        $script:pushPullSafetyTimer.Stop()
-        try {
-            if ($script:pushPullJob -and $script:pushPullJob.State -eq "Running") {
-                Finish-PushPullJob "Timeout" "Job exceeded $($script:pushPullJobTimeoutSec)s, re-enabled."
-            }
-        } catch { Enable-PushPullButtons }
-    })
-    $script:pushPullSafetyTimer.Start()
-}
-
-function Do-Pull {
-    if (-not $script:repoPath) { Do-SelectFolder; return }
-    if ($script:pushPullJob -and $script:pushPullJob.State -eq "Running") { return }
-    $path = $script:repoPath
-    $pullCount = $script:cachedPullCount
-    $script:pushPullJobTimeoutSec = Get-JobTimeoutSec $pullCount
-    Disable-PushPullButtons
-    Show-Balloon "Git Sync" "Pulling..." 1000
-    $script:pushPullJob = Start-Job -ScriptBlock {
-        param($repoPath)
+    } else {
         & git -C $repoPath fetch origin 2>$null | Out-Null
-        $results = @()
-        $totalCommits = 0
-        $dirs = @(@{ Path = $repoPath; Label = "main" })
         foreach ($d in $dirs) {
             $br = & git -C $d.Path branch --show-current 2>$null
             $behind = 0
@@ -344,32 +329,100 @@ function Do-Pull {
                 $b = & git -C $d.Path rev-list --count "HEAD..origin/$br" 2>$null
                 if ($b -match "^\d+$") { $behind = [int]$b }
             }
-            $out = & git -C $d.Path pull 2>&1
-            if ($LASTEXITCODE -eq 0) {
-                $msg = if ($out -match "Already up to date") { "up to date" } else { "updated" }
+            $psi = New-Object System.Diagnostics.ProcessStartInfo
+            $psi.FileName = "git"
+            $psi.Arguments = "-C `"$($d.Path)`" pull --progress"
+            $psi.WorkingDirectory = $d.Path
+            $psi.RedirectStandardOutput = $true
+            $psi.RedirectStandardError = $true
+            $psi.UseShellExecute = $false
+            $psi.CreateNoWindow = $true
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $job.Process = $p
+            $reader = $p.StandardError
+            $job.Stderr = [System.Text.StringBuilder]::new()
+            $readerThread = [System.Threading.Thread]::new({
+                try {
+                    while ($true) {
+                        $line = $reader.ReadLine()
+                        if ($line -eq $null) { break }
+                        $job.LastProgressTime = Get-Date
+                        [void]$job.Stderr.AppendLine($line)
+                    }
+                } catch { }
+            })
+            $readerThread.IsBackground = $true
+            $readerThread.Start()
+            $p.WaitForExit()
+            $readerThread.Join(2000) | Out-Null
+            $stdout = $p.StandardOutput.ReadToEnd()
+            $stderr = $job.Stderr.ToString().Trim()
+            if ($p.ExitCode -eq 0) {
+                $msg = if ($stdout -match "Already up to date") { "up to date" } else { "updated" }
                 $results += "$($d.Label) : $msg"
                 $totalCommits += $behind
             } else {
-                $results += "$($d.Label) : pull failed - $out"
+                $results += "$($d.Label) : pull failed - $stderr"
             }
         }
-        ,@($results, $totalCommits)
-    } -ArgumentList $path
-    $script:pushPullJobStart = Get-Date
-    $script:pushPullJobType = "pull"
+    }
+    ,@($results, $totalCommits)
+}
+
+function Do-Push {
+    if (-not $script:repoPath) { Do-SelectFolder; return }
+    if ($script:pushPullState) { return }
+    $path = $script:repoPath
+    Disable-PushPullButtons
+    Show-Balloon "Git Sync" "Pushing..." 1000
+    $job = @{
+        Process = $null
+        LastProgressTime = Get-Date
+        RepoPath = $path
+        Type = "push"
+    }
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $rs.Open()
+    $ps = [System.Management.Automation.PowerShell]::Create().AddScript($script:pushPullScript).AddArgument($job)
+    $ps.Runspace = $rs
+    $script:pushPullState = @{
+        Job = $job
+        LastProgressTime = $job.LastProgressTime
+        Type = "push"
+        PowerShell = $ps
+        Runspace = $rs
+        AsyncResult = $ps.BeginInvoke()
+    }
     Start-PollTimerIfNeeded
-    $timeoutMs = $script:pushPullJobTimeoutSec * 1000
-    $script:pushPullSafetyTimer = New-Object System.Windows.Forms.Timer
-    $script:pushPullSafetyTimer.Interval = $timeoutMs
-    $script:pushPullSafetyTimer.Add_Tick({
-        $script:pushPullSafetyTimer.Stop()
-        try {
-            if ($script:pushPullJob -and $script:pushPullJob.State -eq "Running") {
-                Finish-PushPullJob "Timeout" "Job exceeded $($script:pushPullJobTimeoutSec)s, re-enabled."
-            }
-        } catch { Enable-PushPullButtons }
-    })
-    $script:pushPullSafetyTimer.Start()
+}
+
+function Do-Pull {
+    if (-not $script:repoPath) { Do-SelectFolder; return }
+    if ($script:pushPullState) { return }
+    $path = $script:repoPath
+    Disable-PushPullButtons
+    Show-Balloon "Git Sync" "Pulling..." 1000
+    $job = @{
+        Process = $null
+        LastProgressTime = Get-Date
+        RepoPath = $path
+        Type = "pull"
+    }
+    $rs = [System.Management.Automation.Runspaces.RunspaceFactory]::CreateRunspace()
+    $rs.Open()
+    $ps = [System.Management.Automation.PowerShell]::Create().AddScript($script:pushPullScript).AddArgument($job)
+    $ps.Runspace = $rs
+    $script:pushPullState = @{
+        Job = $job
+        LastProgressTime = $job.LastProgressTime
+        Type = "pull"
+        PowerShell = $ps
+        Runspace = $rs
+        AsyncResult = $ps.BeginInvoke()
+    }
+    Start-PollTimerIfNeeded
 }
 
 # --- Cached counts: (Commit)/(Push) △ | (Pull) ▽ ---
@@ -552,7 +605,7 @@ $pollTimer = New-Object System.Windows.Forms.Timer
 $pollTimer.Interval = 500
 $pollTimer.Add_Tick({
     try { Check-CountJob } catch { }
-    try { Check-PushPullJob } catch { }
+    try { Check-PushPullState } catch { }
     try { Sync-PushPullButtonState } catch { }
     try { Stop-PollTimerIfIdle } catch { }
 })
@@ -563,7 +616,7 @@ function Start-PollTimerIfNeeded {
 
 function Stop-PollTimerIfIdle {
     $countRunning = $script:countJob -and (try { $script:countJob.State -eq "Running" } catch { $false })
-    $pushPullRunning = $script:pushPullJob -and (try { $script:pushPullJob.State -eq "Running" } catch { $false })
+    $pushPullRunning = $script:pushPullState -and (try { -not $script:pushPullState.PowerShell.IsCompleted } catch { $false })
     if (-not $countRunning -and -not $pushPullRunning) {
         $pollTimer.Stop()
         Sync-PushPullButtonState
