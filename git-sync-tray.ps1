@@ -175,6 +175,7 @@ function Do-SelectFolder {
 # --- Push/Pull with progress-based stall detection (7 sec no progress = force stop) ---
 $script:pushPullState = $null
 $script:pushPullStallSec = 7
+$script:pushPullMaxSec = 60  # fallback: no Process yet after 60s = force stop (fetch/add/commit stuck)
 
 function Enable-PushPullButtons {
     $pushBtn.Enabled = $true
@@ -230,11 +231,21 @@ function Check-PushPullState {
             return
         }
         if (-not $st.PowerShell.IsCompleted) {
-            # Check stall: 7 sec without progress
+            $now = Get-Date
+            # Fallback: stuck in fetch/add/commit (no Process yet) for 60s
+            $startTime = if ($job -and $job.StartTime) { $job.StartTime } else { $st.LastProgressTime }
+            if ($startTime -and (-not $job -or -not $job.Process)) {
+                $totalElapsed = ($now - $startTime).TotalSeconds
+                if ($totalElapsed -gt $script:pushPullMaxSec) {
+                    Finish-PushPullState "Timeout" "No progress for $($script:pushPullMaxSec)s (stuck in fetch/add/commit), stopped."
+                    return
+                }
+            }
+            # Stall: 7 sec without progress (when Process is running)
             $last = if ($job) { $job.LastProgressTime } else { $st.LastProgressTime }
             $proc = if ($job) { $job.Process } else { $null }
             if ($last -and $proc -and -not $proc.HasExited) {
-                $elapsed = ((Get-Date) - $last).TotalSeconds
+                $elapsed = ($now - $last).TotalSeconds
                 if ($elapsed -gt $script:pushPullStallSec) {
                     Finish-PushPullState "Stalled" "No progress for $($script:pushPullStallSec)s, stopped."
                     return
@@ -271,6 +282,7 @@ $script:pushPullScript = {
     $totalCommits = 0
     $dirs = @(@{ Path = $repoPath; Label = "main" })
     $job.LastProgressTime = Get-Date
+    $job.StartTime = Get-Date
     if ($type -eq "push") {
         foreach ($d in $dirs) {
             $status = & git -C $d.Path status --porcelain 2>$null
@@ -380,6 +392,7 @@ function Do-Push {
     $job = @{
         Process = $null
         LastProgressTime = Get-Date
+        StartTime = Get-Date
         RepoPath = $path
         Type = "push"
     }
@@ -407,6 +420,7 @@ function Do-Pull {
     $job = @{
         Process = $null
         LastProgressTime = Get-Date
+        StartTime = Get-Date
         RepoPath = $path
         Type = "pull"
     }
@@ -584,6 +598,8 @@ $notifyIcon.ContextMenuStrip = $menu
 
 $menu.Add_Opening({
     if ($script:repoPath) {
+        try { Check-PushPullState } catch { }
+        if ($script:pushPullState) { Start-PollTimerIfNeeded }
         Sync-PushPullButtonState
         Refresh-CountCache
         Update-CountDisplay
@@ -616,7 +632,15 @@ function Start-PollTimerIfNeeded {
 
 function Stop-PollTimerIfIdle {
     $countRunning = $script:countJob -and (try { $script:countJob.State -eq "Running" } catch { $false })
-    $pushPullRunning = $script:pushPullState -and (try { -not $script:pushPullState.PowerShell.IsCompleted } catch { $false })
+    $pushPullRunning = $false
+    if ($script:pushPullState) {
+        try {
+            $pushPullRunning = -not $script:pushPullState.PowerShell.IsCompleted
+        } catch {
+            # PowerShell inaccessible (disposed/bad state) -> force recover
+            Finish-PushPullState "Error" "Recovered from stuck state."
+        }
+    }
     if (-not $countRunning -and -not $pushPullRunning) {
         $pollTimer.Stop()
         Sync-PushPullButtonState
