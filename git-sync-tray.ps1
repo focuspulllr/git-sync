@@ -1,6 +1,10 @@
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 
+# Ensure UTF-8 for proper Korean display in balloon tips
+$OutputEncoding = [System.Text.Encoding]::UTF8
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
 # --- Config file ---
 $configPath = Join-Path $PSScriptRoot "config.json"
 $repoPath   = $null
@@ -201,9 +205,9 @@ function Finish-PushPullState {
         try {
             $pidFile = $toClear.PidFile
             if ($pidFile -and (Test-Path $pidFile)) {
-                $pid = (Get-Content $pidFile -Raw -ErrorAction SilentlyContinue).Trim()
-                if ($pid -match "^\d+$") {
-                    $proc = Get-Process -Id ([int]$pid) -ErrorAction SilentlyContinue
+                $procId = (Get-Content $pidFile -Raw -ErrorAction SilentlyContinue).Trim()
+                if ($procId -match "^\d+$") {
+                    $proc = Get-Process -Id ([int]$procId) -ErrorAction SilentlyContinue
                     if ($proc -and -not $proc.HasExited) { $proc.Kill() }
                 }
                 Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
@@ -230,7 +234,7 @@ function Finish-PushPullState {
     Enable-PushPullButtons
     $notifyIcon.Text = "Git Sync"
     if ($Title) { try { Show-Balloon $Title $Text } catch { } }
-    try { Refresh-CountCacheSync } catch { }
+    try { Refresh-CountCache } catch { }
 }
 
 function Check-PushPullState {
@@ -241,12 +245,17 @@ function Check-PushPullState {
             Finish-PushPullState "Error" $st.PowerShell.InvocationStateInfo.Reason.Message
             return
         }
-        if (-not $st.PowerShell.IsCompleted) {
+        # Use AsyncWaitHandle for reliable completion detection (IsCompleted can lag for fast completions)
+        $isDone = $false
+        try {
+            $isDone = $st.AsyncResult.AsyncWaitHandle.WaitOne(0)
+        } catch { $isDone = $st.PowerShell.IsCompleted }
+        if (-not $isDone) {
             $now = Get-Date
             $progressFile = $st.ProgressFile
             $pidFile = $st.PidFile
             $startTime = $st.StartTime
-            # Fallback: stuck in fetch/add/commit (no progress file yet) for 60s
+            # Fallback: stuck in fetch/add/commit (no Process yet) for 15s
             $hasProcess = $pidFile -and (Test-Path $pidFile)
             if ($startTime -and -not $hasProcess) {
                 $totalElapsed = ($now - $startTime).TotalSeconds
@@ -275,18 +284,34 @@ function Check-PushPullState {
         $type = $st.Type
         $r = $st.PowerShell.EndInvoke($st.AsyncResult)
         Finish-PushPullState $null $null
-        if ($r -and $r.Count -ge 2) {
-            $msg = $r[0] -join "`n"
-            $commits = $r[1]
+        $msg = $null
+        $commitFiles = 0
+        $commits = 0
+        if ($r) {
+            if ($r.Count -ge 3) {
+                $arr = $r[0]; $msg = if ($arr -is [array]) { $arr -join "`n" } else { [string]$arr }
+                $commitFiles = $r[1]
+                $commits = $r[2]
+            } elseif ($r.Count -ge 2) {
+                $arr = $r[0]; $msg = if ($arr -is [array]) { $arr -join "`n" } else { [string]$arr }
+                $commits = $r[1]
+            } elseif ($r.Count -eq 1 -and $r[0] -is [array] -and $r[0].Count -ge 2) {
+                $arr = $r[0][0]; $msg = if ($arr -is [array]) { $arr -join "`n" } else { [string]$arr }
+                $commitFiles = if ($r[0].Count -ge 3) { $r[0][1] } else { 0 }
+                $commits = $r[0][-1]
+            }
+        }
+        if ($null -ne $msg) {
             if ($type -eq "push") {
-                Show-Balloon "Push Done" "Done: $commits commits`n$msg"
+                $summary = "Commit $commitFiles file(s) | Push $commits commit(s)"
+                Show-Balloon "Push Done" "$summary`n$msg"
             } else {
-                Show-Balloon "Pull Done" "Done: $commits commits`n$msg"
+                $summary = "Pull $commits commit(s)"
+                Show-Balloon "Pull Done" "$summary`n$msg"
             }
         } else {
             Show-Balloon "Error" "No result returned."
         }
-        try { Refresh-CountCacheSync } catch { }
     } catch {
         Finish-PushPullState "Error" $_.Exception.Message
     }
@@ -300,12 +325,13 @@ $script:pushPullScript = {
     $pidFile = $job.PidFile
     $results = @()
     $totalCommits = 0
+    $commitFiles = 0
     $dirs = @(@{ Path = $repoPath; Label = "main" })
-    $writeProgress = { param($path, $line) if ($path) { try { [System.IO.File]::WriteAllText($path, $line) } catch { } } }
     if ($type -eq "push") {
         foreach ($d in $dirs) {
             $status = & git -C $d.Path status --porcelain 2>$null
             if ($status) {
+                $commitFiles += ($status -split "`n").Count
                 & git -C $d.Path add -A 2>$null | Out-Null
                 & git -C $d.Path commit -m "sync: auto-commit from $env:COMPUTERNAME" 2>$null | Out-Null
             }
@@ -325,25 +351,17 @@ $script:pushPullScript = {
             $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
             $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
             $p = [System.Diagnostics.Process]::Start($psi)
-            if ($pidFile) { try { $p.Id | Out-File $pidFile -Encoding ascii } catch { } }
-            if ($progressFile) { try { [System.IO.File]::WriteAllText($progressFile, "Starting...") } catch { } }
-            $reader = $p.StandardError
+            try { [System.IO.File]::WriteAllText($pidFile, $p.Id.ToString()) } catch { }
+            $stdoutTask = $p.StandardOutput.ReadToEndAsync()
             $stderrSb = [System.Text.StringBuilder]::new()
-            $readerThread = [System.Threading.Thread]::new({
-                try {
-                    while ($true) {
-                        $line = $reader.ReadLine()
-                        if ($line -eq $null) { break }
-                        & $writeProgress $progressFile $line
-                        [void]$stderrSb.AppendLine($line)
-                    }
-                } catch { }
-            })
-            $readerThread.IsBackground = $true
-            $readerThread.Start()
+            while ($true) {
+                $line = $p.StandardError.ReadLine()
+                if ($line -eq $null) { break }
+                try { [System.IO.File]::WriteAllText($progressFile, $line) } catch { }
+                [void]$stderrSb.AppendLine($line)
+            }
             $p.WaitForExit()
-            $readerThread.Join(2000) | Out-Null
-            $stdout = $p.StandardOutput.ReadToEnd()
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
             $stderr = $stderrSb.ToString().Trim()
             if ($p.ExitCode -eq 0) {
                 $results += "$($d.Label) : pushed ($br)"
@@ -372,25 +390,17 @@ $script:pushPullScript = {
             $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
             $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
             $p = [System.Diagnostics.Process]::Start($psi)
-            if ($pidFile) { try { $p.Id | Out-File $pidFile -Encoding ascii } catch { } }
-            if ($progressFile) { try { [System.IO.File]::WriteAllText($progressFile, "Starting...") } catch { } }
-            $reader = $p.StandardError
+            try { [System.IO.File]::WriteAllText($pidFile, $p.Id.ToString()) } catch { }
+            $stdoutTask = $p.StandardOutput.ReadToEndAsync()
             $stderrSb = [System.Text.StringBuilder]::new()
-            $readerThread = [System.Threading.Thread]::new({
-                try {
-                    while ($true) {
-                        $line = $reader.ReadLine()
-                        if ($line -eq $null) { break }
-                        & $writeProgress $progressFile $line
-                        [void]$stderrSb.AppendLine($line)
-                    }
-                } catch { }
-            })
-            $readerThread.IsBackground = $true
-            $readerThread.Start()
+            while ($true) {
+                $line = $p.StandardError.ReadLine()
+                if ($line -eq $null) { break }
+                try { [System.IO.File]::WriteAllText($progressFile, $line) } catch { }
+                [void]$stderrSb.AppendLine($line)
+            }
             $p.WaitForExit()
-            $readerThread.Join(2000) | Out-Null
-            $stdout = $p.StandardOutput.ReadToEnd()
+            $stdout = $stdoutTask.GetAwaiter().GetResult()
             $stderr = $stderrSb.ToString().Trim()
             if ($p.ExitCode -eq 0) {
                 $msg = if ($stdout -match "Already up to date") { "up to date" } else { "updated" }
@@ -401,7 +411,7 @@ $script:pushPullScript = {
             }
         }
     }
-    ,@($results, $totalCommits)
+    @($results, $commitFiles, $totalCommits)
 }
 
 function Do-Push {
@@ -410,8 +420,10 @@ function Do-Push {
     $path = $script:repoPath
     Disable-PushPullButtons
     Show-Balloon "Git Sync" "Pushing..." 1000
-    $progressFile = [System.IO.Path]::GetTempFileName()
-    $pidFile = [System.IO.Path]::GetTempFileName()
+    $progressFile = Join-Path $env:TEMP "gitsync-progress.tmp"
+    $pidFile = Join-Path $env:TEMP "gitsync-pid.tmp"
+    Remove-Item $progressFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
     $job = @{
         RepoPath = $path
         Type = "push"
@@ -440,8 +452,10 @@ function Do-Pull {
     $path = $script:repoPath
     Disable-PushPullButtons
     Show-Balloon "Git Sync" "Pulling..." 1000
-    $progressFile = [System.IO.Path]::GetTempFileName()
-    $pidFile = [System.IO.Path]::GetTempFileName()
+    $progressFile = Join-Path $env:TEMP "gitsync-progress.tmp"
+    $pidFile = Join-Path $env:TEMP "gitsync-pid.tmp"
+    Remove-Item $progressFile -Force -ErrorAction SilentlyContinue
+    Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
     $job = @{
         RepoPath = $path
         Type = "pull"
@@ -681,7 +695,8 @@ function Stop-PollTimerIfIdle {
     $pushPullRunning = $false
     if ($script:pushPullState) {
         try {
-            $pushPullRunning = -not $script:pushPullState.PowerShell.IsCompleted
+            $done = $script:pushPullState.AsyncResult.AsyncWaitHandle.WaitOne(0)
+            $pushPullRunning = -not $done
         } catch {
             # PowerShell inaccessible (disposed/bad state) -> force recover
             Finish-PushPullState "Error" "Recovered from stuck state."
