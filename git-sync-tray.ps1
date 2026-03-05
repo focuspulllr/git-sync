@@ -172,11 +172,17 @@ function Do-SelectFolder {
     }
 }
 
-# --- Push/Pull background job (buttons disabled, 10s safety) ---
+# --- Push/Pull background job (buttons disabled, count-based timeout) ---
 $script:pushPullJob = $null
 $script:pushPullJobStart = $null
 $script:pushPullJobType = $null
+$script:pushPullJobTimeoutSec = 10
 $script:pushPullSafetyTimer = $null
+
+function Get-JobTimeoutSec {
+    param([int]$Count)
+    return [math]::Min(10 + $Count * 2, 60)
+}
 
 function Enable-PushPullButtons {
     $pushBtn.Enabled = $true
@@ -226,8 +232,9 @@ function Check-PushPullJob {
         return
     }
     if ($state -eq "Running") {
-        if ($script:pushPullJobStart -and ((Get-Date) - $script:pushPullJobStart).TotalSeconds -gt 10) {
-            Finish-PushPullJob "Timeout" "Job exceeded 10s, re-enabled."
+        $limit = $script:pushPullJobTimeoutSec
+        if ($script:pushPullJobStart -and ((Get-Date) - $script:pushPullJobStart).TotalSeconds -gt $limit) {
+            Finish-PushPullJob "Timeout" "Job exceeded ${limit}s, re-enabled."
             return
         }
         return
@@ -259,6 +266,18 @@ function Do-Push {
     if (-not $script:repoPath) { Do-SelectFolder; return }
     if ($script:pushPullJob -and $script:pushPullJob.State -eq "Running") { return }
     $path = $script:repoPath
+    $pushCount = 0
+    try {
+        $status = (Invoke-Git $path @("status", "--porcelain") -TimeoutMs 3000).Out
+        $hasUncommitted = [bool]$status
+        $br = (Invoke-Git $path @("branch", "--show-current") -TimeoutMs 3000).Out
+        if ($br) {
+            $ahead = (Invoke-Git $path @("rev-list", "--count", "origin/$br..HEAD") -TimeoutMs 3000).Out
+            $pushCount = if ($ahead -match "^\d+$") { [int]$ahead } else { 0 }
+        }
+        if ($hasUncommitted) { $pushCount = [math]::Max($pushCount, 1) }
+    } catch { }
+    $script:pushPullJobTimeoutSec = Get-JobTimeoutSec $pushCount
     Disable-PushPullButtons
     Show-Balloon "Git Sync" "Pushing..." 1000
     $script:pushPullJob = Start-Job -ScriptBlock {
@@ -290,13 +309,14 @@ function Do-Push {
     $script:pushPullJobStart = Get-Date
     $script:pushPullJobType = "push"
     Start-PollTimerIfNeeded
+    $timeoutMs = $script:pushPullJobTimeoutSec * 1000
     $script:pushPullSafetyTimer = New-Object System.Windows.Forms.Timer
-    $script:pushPullSafetyTimer.Interval = 10000
+    $script:pushPullSafetyTimer.Interval = $timeoutMs
     $script:pushPullSafetyTimer.Add_Tick({
         $script:pushPullSafetyTimer.Stop()
         try {
             if ($script:pushPullJob -and $script:pushPullJob.State -eq "Running") {
-                Finish-PushPullJob "Timeout" "Job exceeded 10s, re-enabled."
+                Finish-PushPullJob "Timeout" "Job exceeded $($script:pushPullJobTimeoutSec)s, re-enabled."
             }
         } catch { Enable-PushPullButtons }
     })
@@ -307,6 +327,8 @@ function Do-Pull {
     if (-not $script:repoPath) { Do-SelectFolder; return }
     if ($script:pushPullJob -and $script:pushPullJob.State -eq "Running") { return }
     $path = $script:repoPath
+    $pullCount = $script:cachedPullCount
+    $script:pushPullJobTimeoutSec = Get-JobTimeoutSec $pullCount
     Disable-PushPullButtons
     Show-Balloon "Git Sync" "Pulling..." 1000
     $script:pushPullJob = Start-Job -ScriptBlock {
@@ -336,13 +358,14 @@ function Do-Pull {
     $script:pushPullJobStart = Get-Date
     $script:pushPullJobType = "pull"
     Start-PollTimerIfNeeded
+    $timeoutMs = $script:pushPullJobTimeoutSec * 1000
     $script:pushPullSafetyTimer = New-Object System.Windows.Forms.Timer
-    $script:pushPullSafetyTimer.Interval = 10000
+    $script:pushPullSafetyTimer.Interval = $timeoutMs
     $script:pushPullSafetyTimer.Add_Tick({
         $script:pushPullSafetyTimer.Stop()
         try {
             if ($script:pushPullJob -and $script:pushPullJob.State -eq "Running") {
-                Finish-PushPullJob "Timeout" "Job exceeded 10s, re-enabled."
+                Finish-PushPullJob "Timeout" "Job exceeded $($script:pushPullJobTimeoutSec)s, re-enabled."
             }
         } catch { Enable-PushPullButtons }
     })
