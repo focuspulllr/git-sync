@@ -131,6 +131,7 @@ function Do-SelectFolder {
             Save-Config $selected
             Update-MenuState
             Show-Balloon "Git Sync" "Repo set: $selected"
+            Refresh-CountCache
         } else {
             [System.Windows.Forms.MessageBox]::Show(
                 "Selected folder is not a git repository.`n(.git folder not found)",
@@ -143,21 +144,100 @@ function Do-SelectFolder {
 function Do-Push {
     if (-not $script:repoPath) { Do-SelectFolder; return }
     $dirs = Get-WorkDirs
-    Show-Balloon "Git Sync" "Pushing... ($($dirs.Count)개)" 1000
+    Show-Balloon "Git Sync" "Pushing... ($($dirs.Count))" 1000
     $results = @()
     foreach ($d in $dirs) { $results += Push-Repo $d.Path $d.Label }
     $done = ($results | Where-Object { $_ -match "pushed|no changes" }).Count
-    Show-Balloon "Push Done" "완료: $done/$($dirs.Count)개`n$($results -join "`n")"
+    Show-Balloon "Push Done" "Done: $done/$($dirs.Count)`n$($results -join "`n")"
+    Refresh-CountCacheSync
 }
 
 function Do-Pull {
     if (-not $script:repoPath) { Do-SelectFolder; return }
     $dirs = Get-WorkDirs
-    Show-Balloon "Git Sync" "Pulling... ($($dirs.Count)개)" 1000
+    Show-Balloon "Git Sync" "Pulling... ($($dirs.Count))" 1000
     $results = @()
     foreach ($d in $dirs) { $results += Pull-Repo $d.Path $d.Label }
     $done = ($results | Where-Object { $_ -match "updated|up to date" }).Count
-    Show-Balloon "Pull Done" "완료: $done/$($dirs.Count)개`n$($results -join "`n")"
+    Show-Balloon "Pull Done" "Done: $done/$($dirs.Count)`n$($results -join "`n")"
+    Refresh-CountCacheSync
+}
+
+# --- Cached counts (background refresh, UI never blocks) ---
+$script:cachedPushCount = 0
+$script:cachedPullCount = 0
+$script:countJob = $null
+
+function Refresh-CountCache {
+    if (-not $script:repoPath) { return }
+    if ($script:countJob) {
+        if ($script:countJob.State -eq "Running") { return }
+        Remove-Job $script:countJob -Force -ErrorAction SilentlyContinue
+    }
+    $path = $script:repoPath
+    $script:countJob = Start-Job -ScriptBlock {
+        param($repoPath)
+        $pushCnt = 0
+        $pullCnt = 0
+        $dirs = @(@{ Path = $repoPath; Label = "main" })
+        $wtRoot = Join-Path $repoPath ".claude\worktrees"
+        if (Test-Path $wtRoot) {
+            Get-ChildItem $wtRoot -Directory | ForEach-Object {
+                if (Test-Path (Join-Path $_.FullName ".git") -PathType Leaf) {
+                    $dirs += @{ Path = $_.FullName; Label = $_.Name }
+                }
+            }
+        }
+        foreach ($d in $dirs) {
+            $r = & git -C $d.Path status --porcelain 2>$null
+            if ($r) { $pushCnt++; continue }
+            $br = & git -C $d.Path branch --show-current 2>$null
+            if ($br) {
+                $a = & git -C $d.Path rev-list --count "origin/$br..HEAD" 2>$null
+                if ($a -match "^\d+$" -and [int]$a -gt 0) { $pushCnt++ }
+            }
+        }
+        & git -C $repoPath fetch origin 2>$null | Out-Null
+        foreach ($d in $dirs) {
+            $br = & git -C $d.Path branch --show-current 2>$null
+            if ($br) {
+                $b = & git -C $d.Path rev-list --count "HEAD..origin/$br" 2>$null
+                if ($b -match "^\d+$" -and [int]$b -gt 0) { $pullCnt++ }
+            }
+        }
+        @($pushCnt, $pullCnt)
+    } -ArgumentList $path
+}
+
+function Check-CountJob {
+    if (-not $script:countJob -or $script:countJob.State -ne "Completed") { return }
+    try {
+        $r = Receive-Job $script:countJob
+        Remove-Job $script:countJob -Force
+        $script:countJob = $null
+        if ($r -and $r.Count -ge 2) {
+            $script:cachedPushCount = $r[0]
+            $script:cachedPullCount = $r[1]
+            if ($countItem.Visible) {
+                $up = [char]0x25B3
+                $dn = [char]0x25BD
+                $countItem.Text = "  $($script:cachedPushCount) $up | $($script:cachedPullCount) $dn"
+            }
+        }
+    } catch { }
+}
+
+function Refresh-CountCacheSync {
+    if (-not $script:repoPath) { return }
+    try {
+        $script:cachedPushCount = Get-PushCount
+        $script:cachedPullCount = Get-PullCount
+        if ($countItem.Visible) {
+            $up = [char]0x25B3
+            $dn = [char]0x25BD
+            $countItem.Text = "  $($script:cachedPushCount) $up | $($script:cachedPullCount) $dn"
+        }
+    } catch { }
 }
 
 # --- Update menu text to show current repo and counts ---
@@ -172,14 +252,17 @@ function Update-MenuState {
 
 function Update-CountDisplay {
     if (-not $script:repoPath) {
-        $pushCountItem.Visible = $false
-        $pullCountItem.Visible = $false
+        $countItem.Visible = $false
         return
     }
-    $pushCountItem.Visible = $true
-    $pullCountItem.Visible = $true
-    $pushCountItem.Text = "  Commit+Push: $(Get-PushCount)"
-    $pullCountItem.Text = "  Pull: $(Get-PullCount)"
+    $countItem.Visible = $true
+    $up = [char]0x25B3
+    $dn = [char]0x25BD
+    if ($script:countJob -and $script:countJob.State -eq "Running") {
+        $countItem.Text = "  - $up | - $dn"
+    } else {
+        $countItem.Text = "  $($script:cachedPushCount) $up | $($script:cachedPullCount) $dn"
+    }
 }
 
 # --- Tray icon ---
@@ -200,10 +283,8 @@ $menu.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 $folderBtn = $menu.Items.Add("Select Repo Folder...")
 $folderBtn.Add_Click({ Do-SelectFolder })
 
-$pushCountItem = $menu.Items.Add("  Commit+Push: 0")
-$pushCountItem.Enabled = $false
-$pullCountItem = $menu.Items.Add("  Pull: 0")
-$pullCountItem.Enabled = $false
+$countItem = $menu.Items.Add(("  0 " + [char]0x25B3 + " | 0 " + [char]0x25BD))
+$countItem.Enabled = $false
 
 $menu.Items.Add("-") | Out-Null
 
@@ -225,7 +306,10 @@ $exitBtn.Add_Click({
 $notifyIcon.ContextMenuStrip = $menu
 
 $menu.Add_Opening({
-    if ($script:repoPath) { Update-CountDisplay }
+    if ($script:repoPath) {
+        Refresh-CountCache
+        Update-CountDisplay
+    }
 })
 
 $notifyIcon.Add_Click({
@@ -237,5 +321,11 @@ $notifyIcon.Add_Click({
 # --- Init ---
 $script:repoPath = Load-Config
 Update-MenuState
+
+# Poll for job result every 500ms (when menu opened, check runs in background)
+$pollTimer = New-Object System.Windows.Forms.Timer
+$pollTimer.Interval = 500
+$pollTimer.Add_Tick({ Check-CountJob })
+$pollTimer.Start()
 
 [System.Windows.Forms.Application]::Run()
