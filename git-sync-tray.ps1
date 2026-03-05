@@ -39,19 +39,10 @@ function Invoke-Git {
     return @{ Out = $stdout.Trim(); Err = $stderr.Trim(); Code = $p.ExitCode }
 }
 
-# --- Collect work dirs (main + worktrees) ---
+# --- Collect work dirs (main repo only) ---
 function Get-WorkDirs {
     if (-not $script:repoPath) { return @() }
-    $dirs = @(@{ Path = $script:repoPath; Label = "main" })
-    $wtRoot = Join-Path $script:repoPath ".claude\worktrees"
-    if (Test-Path $wtRoot) {
-        Get-ChildItem $wtRoot -Directory | ForEach-Object {
-            if (Test-Path (Join-Path $_.FullName ".git") -PathType Leaf) {
-                $dirs += @{ Path = $_.FullName; Label = $_.Name }
-            }
-        }
-    }
-    return $dirs
+    return @(@{ Path = $script:repoPath; Label = "main" })
 }
 
 # --- Count: (Commit) uncommitted files, (Push) unpushed commits, (Pull) behind origin ---
@@ -95,27 +86,45 @@ function Get-PullCount {
 # --- Push one dir ---
 function Push-Repo([string]$Dir, [string]$Label) {
     $status = Invoke-Git $Dir @("status", "--porcelain")
-    if (-not $status.Out) { return "$Label : no changes" }
+    if (-not $status.Out) {
+        $branch = (Invoke-Git $Dir @("branch", "--show-current")).Out
+        if (-not $branch) { return @{ Msg = "$Label : no branch"; Commits = 0 } }
+        $ahead = (Invoke-Git $Dir @("rev-list", "--count", "origin/$branch..HEAD")).Out
+        $n = if ($ahead -match "^\d+$") { [int]$ahead } else { 0 }
+        if ($n -eq 0) { return @{ Msg = "$Label : no changes"; Commits = 0 } }
+        $r = Invoke-Git $Dir @("push", "origin", $branch)
+        if ($r.Code -ne 0) { return @{ Msg = "$Label : push failed - $($r.Err)"; Commits = 0 } }
+        return @{ Msg = "$Label : pushed ($branch)"; Commits = $n }
+    }
 
     Invoke-Git $Dir @("add", "-A") | Out-Null
     $msg = "sync: auto-commit from $env:COMPUTERNAME"
     $r = Invoke-Git $Dir @("commit", "-m", "`"$msg`"")
-    if ($r.Code -ne 0) { return "$Label : commit failed" }
+    if ($r.Code -ne 0) { return @{ Msg = "$Label : commit failed"; Commits = 0 } }
 
     $branch = (Invoke-Git $Dir @("branch", "--show-current")).Out
-    if (-not $branch) { return "$Label : no branch" }
+    if (-not $branch) { return @{ Msg = "$Label : no branch"; Commits = 0 } }
+
+    $ahead = (Invoke-Git $Dir @("rev-list", "--count", "origin/$branch..HEAD")).Out
+    $n = if ($ahead -match "^\d+$") { [int]$ahead } else { 0 }
 
     $r = Invoke-Git $Dir @("push", "origin", $branch)
-    if ($r.Code -ne 0) { return "$Label : push failed - $($r.Err)" }
-    return "$Label : pushed ($branch)"
+    if ($r.Code -ne 0) { return @{ Msg = "$Label : push failed - $($r.Err)"; Commits = 0 } }
+    return @{ Msg = "$Label : pushed ($branch)"; Commits = $n }
 }
 
 # --- Pull one dir ---
 function Pull-Repo([string]$Dir, [string]$Label) {
+    $branch = (Invoke-Git $Dir @("branch", "--show-current")).Out
+    $behind = 0
+    if ($branch) {
+        $b = (Invoke-Git $Dir @("rev-list", "--count", "HEAD..origin/$branch")).Out
+        if ($b -match "^\d+$") { $behind = [int]$b }
+    }
     $r = Invoke-Git $Dir @("pull")
-    if ($r.Code -ne 0) { return "$Label : pull failed - $($r.Err)" }
+    if ($r.Code -ne 0) { return @{ Msg = "$Label : pull failed - $($r.Err)"; Commits = 0 } }
     $msg = if ($r.Out -match "Already up to date") { "up to date" } else { "updated" }
-    return "$Label : $msg"
+    return @{ Msg = "$Label : $msg"; Commits = $behind }
 }
 
 # --- Balloon ---
@@ -152,22 +161,41 @@ function Do-SelectFolder {
 function Do-Push {
     if (-not $script:repoPath) { Do-SelectFolder; return }
     $dirs = Get-WorkDirs
-    Show-Balloon "Git Sync" "Pushing... ($($dirs.Count))" 1000
+    Show-Balloon "Git Sync" "Pushing..." 1000
     $results = @()
-    foreach ($d in $dirs) { $results += Push-Repo $d.Path $d.Label }
+    $totalCommits = 0
+    foreach ($d in $dirs) {
+        $r = Push-Repo $d.Path $d.Label
+        if ($r -is [hashtable]) {
+            $results += $r.Msg
+            $totalCommits += $r.Commits
+        } else {
+            $results += $r
+        }
+    }
     $done = ($results | Where-Object { $_ -match "pushed|no changes" }).Count
-    Show-Balloon "Push Done" "Done: $done/$($dirs.Count)`n$($results -join "`n")"
+    Show-Balloon "Push Done" "Done: $totalCommits commits`n$($results -join "`n")"
     Refresh-CountCacheSync
 }
 
 function Do-Pull {
     if (-not $script:repoPath) { Do-SelectFolder; return }
+    Invoke-Git $script:repoPath @("fetch", "origin") 2>$null | Out-Null
     $dirs = Get-WorkDirs
-    Show-Balloon "Git Sync" "Pulling... ($($dirs.Count))" 1000
+    Show-Balloon "Git Sync" "Pulling..." 1000
     $results = @()
-    foreach ($d in $dirs) { $results += Pull-Repo $d.Path $d.Label }
+    $totalCommits = 0
+    foreach ($d in $dirs) {
+        $r = Pull-Repo $d.Path $d.Label
+        if ($r -is [hashtable]) {
+            $results += $r.Msg
+            $totalCommits += $r.Commits
+        } else {
+            $results += $r
+        }
+    }
     $done = ($results | Where-Object { $_ -match "updated|up to date" }).Count
-    Show-Balloon "Pull Done" "Done: $done/$($dirs.Count)`n$($results -join "`n")"
+    Show-Balloon "Pull Done" "Done: $totalCommits commits`n$($results -join "`n")"
     Refresh-CountCacheSync
 }
 
@@ -190,14 +218,6 @@ function Refresh-CountCache {
         $pushCnt = 0
         $pullCnt = 0
         $dirs = @(@{ Path = $repoPath; Label = "main" })
-        $wtRoot = Join-Path $repoPath ".claude\worktrees"
-        if (Test-Path $wtRoot) {
-            Get-ChildItem $wtRoot -Directory | ForEach-Object {
-                if (Test-Path (Join-Path $_.FullName ".git") -PathType Leaf) {
-                    $dirs += @{ Path = $_.FullName; Label = $_.Name }
-                }
-            }
-        }
         foreach ($d in $dirs) {
             $r = & git -C $d.Path status --porcelain 2>$null
             if ($r) { $commitCnt += ($r -split "`n").Count }
