@@ -54,22 +54,30 @@ function Get-WorkDirs {
     return $dirs
 }
 
-# --- Count dirs needing push (uncommitted or unpushed) ---
-function Get-PushCount {
+# --- Count: (Commit) uncommitted files, (Push) unpushed commits, (Pull) behind origin ---
+function Get-CommitCount {
     $dirs = Get-WorkDirs
     $cnt = 0
     foreach ($d in $dirs) {
         $status = (Invoke-Git $d.Path @("status", "--porcelain")).Out
-        if ($status) { $cnt++; continue }
-        $branch = (Invoke-Git $d.Path @("branch", "--show-current")).Out
-        if (-not $branch) { continue }
-        $ahead = (Invoke-Git $d.Path @("rev-list", "--count", "origin/$branch..HEAD")).Out
-        if ($ahead -match "^\d+$" -and [int]$ahead -gt 0) { $cnt++ }
+        if ($status) { $cnt += ($status -split "`n").Count }
     }
     return $cnt
 }
 
-# --- Count dirs needing pull (behind origin) ---
+function Get-PushCount {
+    $dirs = Get-WorkDirs
+    $cnt = 0
+    foreach ($d in $dirs) {
+        $branch = (Invoke-Git $d.Path @("branch", "--show-current")).Out
+        if (-not $branch) { continue }
+        $ahead = (Invoke-Git $d.Path @("rev-list", "--count", "origin/$branch..HEAD")).Out
+        if ($ahead -match "^\d+$") { $cnt += [int]$ahead }
+    }
+    return $cnt
+}
+
+# --- Count commits to pull (behind origin) ---
 function Get-PullCount {
     $dirs = Get-WorkDirs
     if ($dirs.Count -eq 0) { return 0 }
@@ -79,7 +87,7 @@ function Get-PullCount {
         $branch = (Invoke-Git $d.Path @("branch", "--show-current")).Out
         if (-not $branch) { continue }
         $behind = (Invoke-Git $d.Path @("rev-list", "--count", "HEAD..origin/$branch")).Out
-        if ($behind -match "^\d+$" -and [int]$behind -gt 0) { $cnt++ }
+        if ($behind -match "^\d+$") { $cnt += [int]$behind }
     }
     return $cnt
 }
@@ -163,7 +171,8 @@ function Do-Pull {
     Refresh-CountCacheSync
 }
 
-# --- Cached counts (background refresh, UI never blocks) ---
+# --- Cached counts: (Commit)/(Push) △ | (Pull) ▽ ---
+$script:cachedCommitCount = 0
 $script:cachedPushCount = 0
 $script:cachedPullCount = 0
 $script:countJob = $null
@@ -177,6 +186,7 @@ function Refresh-CountCache {
     $path = $script:repoPath
     $script:countJob = Start-Job -ScriptBlock {
         param($repoPath)
+        $commitCnt = 0
         $pushCnt = 0
         $pullCnt = 0
         $dirs = @(@{ Path = $repoPath; Label = "main" })
@@ -190,11 +200,11 @@ function Refresh-CountCache {
         }
         foreach ($d in $dirs) {
             $r = & git -C $d.Path status --porcelain 2>$null
-            if ($r) { $pushCnt++; continue }
+            if ($r) { $commitCnt += ($r -split "`n").Count }
             $br = & git -C $d.Path branch --show-current 2>$null
             if ($br) {
                 $a = & git -C $d.Path rev-list --count "origin/$br..HEAD" 2>$null
-                if ($a -match "^\d+$" -and [int]$a -gt 0) { $pushCnt++ }
+                if ($a -match "^\d+$") { $pushCnt += [int]$a }
             }
         }
         & git -C $repoPath fetch origin 2>$null | Out-Null
@@ -202,10 +212,10 @@ function Refresh-CountCache {
             $br = & git -C $d.Path branch --show-current 2>$null
             if ($br) {
                 $b = & git -C $d.Path rev-list --count "HEAD..origin/$br" 2>$null
-                if ($b -match "^\d+$" -and [int]$b -gt 0) { $pullCnt++ }
+                if ($b -match "^\d+$") { $pullCnt += [int]$b }
             }
         }
-        @($pushCnt, $pullCnt)
+        @($commitCnt, $pushCnt, $pullCnt)
     } -ArgumentList $path
 }
 
@@ -215,13 +225,14 @@ function Check-CountJob {
         $r = Receive-Job $script:countJob
         Remove-Job $script:countJob -Force
         $script:countJob = $null
-        if ($r -and $r.Count -ge 2) {
-            $script:cachedPushCount = $r[0]
-            $script:cachedPullCount = $r[1]
+        if ($r -and $r.Count -ge 3) {
+            $script:cachedCommitCount = $r[0]
+            $script:cachedPushCount = $r[1]
+            $script:cachedPullCount = $r[2]
             if ($countItem.Visible) {
                 $up = [char]0x25B3
                 $dn = [char]0x25BD
-                $countItem.Text = "  $($script:cachedPushCount) $up | $($script:cachedPullCount) $dn"
+                $countItem.Text = "  $($script:cachedCommitCount)/$($script:cachedPushCount) $up | $($script:cachedPullCount) $dn"
             }
         }
     } catch { }
@@ -230,12 +241,13 @@ function Check-CountJob {
 function Refresh-CountCacheSync {
     if (-not $script:repoPath) { return }
     try {
+        $script:cachedCommitCount = Get-CommitCount
         $script:cachedPushCount = Get-PushCount
         $script:cachedPullCount = Get-PullCount
         if ($countItem.Visible) {
             $up = [char]0x25B3
             $dn = [char]0x25BD
-            $countItem.Text = "  $($script:cachedPushCount) $up | $($script:cachedPullCount) $dn"
+            $countItem.Text = "  $($script:cachedCommitCount)/$($script:cachedPushCount) $up | $($script:cachedPullCount) $dn"
         }
     } catch { }
 }
@@ -259,9 +271,9 @@ function Update-CountDisplay {
     $up = [char]0x25B3
     $dn = [char]0x25BD
     if ($script:countJob -and $script:countJob.State -eq "Running") {
-        $countItem.Text = "  - $up | - $dn"
+        $countItem.Text = "  -/- $up | - $dn"
     } else {
-        $countItem.Text = "  $($script:cachedPushCount) $up | $($script:cachedPullCount) $dn"
+        $countItem.Text = "  $($script:cachedCommitCount)/$($script:cachedPushCount) $up | $($script:cachedPullCount) $dn"
     }
 }
 
@@ -283,7 +295,7 @@ $menu.Font = New-Object System.Drawing.Font("Segoe UI", 10)
 $folderBtn = $menu.Items.Add("Select Repo Folder...")
 $folderBtn.Add_Click({ Do-SelectFolder })
 
-$countItem = $menu.Items.Add(("  0 " + [char]0x25B3 + " | 0 " + [char]0x25BD))
+$countItem = $menu.Items.Add(("  0/0 " + [char]0x25B3 + " | 0 " + [char]0x25BD))
 $countItem.Enabled = $false
 
 $menu.Items.Add("-") | Out-Null
